@@ -1,0 +1,43 @@
+{
+    admin off
+}
+
+:8080 {
+    root * /srv/backend
+    encode zstd gzip
+    header {
+        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Embedder-Policy "require-corp"
+        Cross-Origin-Resource-Policy "cross-origin"
+        Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+        Pragma "no-cache"
+        Expires "0"
+    }
+
+    handle_path /difix/* {
+        reverse_proxy difix:8765
+    }
+    handle_path /flux/* {
+        reverse_proxy flux:8771
+    }
+    handle_path /orbit/* {
+        reverse_proxy orbit:8772
+    }
+
+    @difix_compat path /refine /api/difix-refine
+    handle @difix_compat {
+        reverse_proxy difix:8765
+    }
+    @flux_compat path /fill
+    handle @flux_compat {
+        reverse_proxy flux:8771
+    }
+    @orbit_public path /gallery /source /thumbnail /splat /splat_stream /orbit_preview
+    handle @orbit_public {
+        reverse_proxy orbit:8772
+    }
+
+    handle {
+        file_server
+    }
+}

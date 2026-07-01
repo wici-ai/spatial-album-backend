@@ -1,0 +1,11 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">WiCi Backend on %h</name>
+  <service>
+    <type>_wici-backend._tcp</type>
+    <port>54228</port>
+    <txt-record>version=1</txt-record>
+    <txt-record>base=/</txt-record>
+  </service>
+</service-group>

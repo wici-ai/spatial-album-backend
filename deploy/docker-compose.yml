@@ -1,0 +1,105 @@
+name: wici-form1
+
+x-backend-common: &backend-common
+  image: spatial-album-backend:cu128
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.backend
+  init: true
+  gpus: all
+  environment: &backend-env
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    HF_HOME: ${HF_HOME:-/models/huggingface}
+    TORCH_HOME: ${TORCH_HOME:-/models/torch}
+    SHARP_CKPT: ${SHARP_CKPT:-/models/torch/hub/checkpoints/sharp_2572gikvuh.pt}
+    MVP_DIFIX_ROOT: ${MVP_DIFIX_ROOT:-/models/difix}
+    MVP_DIFIX_SRC: ${MVP_DIFIX_SRC:-/opt/Difix3D/src}
+    MVP_DIFIX_SOURCE: ${MVP_DIFIX_SOURCE:-/models/difix/source_photo_original.jpg}
+    WICI_FLUX_OUT_DIR: ${WICI_FLUX_OUT_DIR:-/models/flux/flux_peripheral}
+    WICI_FLUX_CONFIG_DIR: ${WICI_FLUX_CONFIG_DIR:-/models/flux/flux_peripheral/hf_flux1_fill_dev_config}
+    WICI_FLUX_PROMPT_EMBEDS: ${WICI_FLUX_PROMPT_EMBEDS:-/models/flux/flux_peripheral/prompt_embeds.pt}
+    WICI_FLUX_TRANSFORMER: ${WICI_FLUX_TRANSFORMER:-/models/ComfyUI/models/diffusion_models/flux1-fill-dev.safetensors}
+    WICI_FLUX_VAE: ${WICI_FLUX_VAE:-/models/ComfyUI/models/vae/ae.safetensors}
+  volumes:
+    - ${WICI_MODEL_DIR:?Set WICI_MODEL_DIR in deploy/.env}:/models
+    - ${WICI_RUNTIME_DIR:-./runtime}:/runtime
+    - ..:/opt/wici/spatial-album-backend:ro
+    - ./scripts/start-service.sh:/usr/local/bin/wici-start-service:ro
+    - ./scripts/download_weights.py:/usr/local/bin/wici-download-weights:ro
+  restart: unless-stopped
+
+services:
+  orbit:
+    <<: *backend-common
+    command: ["orbit"]
+    environment:
+      <<: *backend-env
+      WICI_ORBIT_PORT: "8772"
+    expose:
+      - "8772"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8772/health >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  difix:
+    <<: *backend-common
+    command: ["difix"]
+    environment:
+      <<: *backend-env
+      MVP_DIFIX_PORT: "8765"
+    expose:
+      - "8765"
+    depends_on:
+      orbit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  flux:
+    <<: *backend-common
+    command: ["flux"]
+    environment:
+      <<: *backend-env
+      WICI_FLUX_PORT: "8771"
+    expose:
+      - "8771"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8771/health >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "${WICI_BACKEND_PORT:-54228}:8080"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../backend:/srv/backend:ro
+    depends_on:
+      orbit:
+        condition: service_started
+      difix:
+        condition: service_started
+      flux:
+        condition: service_started
+
+  downloader:
+    <<: *backend-common
+    profiles: ["tools"]
+    entrypoint: ["/usr/local/bin/wici-download-weights"]
+    command: []
+    restart: "no"
+    environment:
+      <<: *backend-env
+      HF_TOKEN: ${HF_TOKEN:-}

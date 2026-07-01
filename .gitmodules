@@ -1,0 +1,6 @@
+[submodule "third_party/ml-sharp"]
+	path = third_party/ml-sharp
+	url = https://github.com/apple/ml-sharp.git
+[submodule "third_party/Difix3D"]
+	path = third_party/Difix3D
+	url = https://github.com/nv-tlabs/Difix3D.git

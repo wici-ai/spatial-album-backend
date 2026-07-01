@@ -1,0 +1,8 @@
+.git
+.gitmodules
+deploy/.env
+deploy/models
+deploy/runtime
+**/__pycache__
+**/*.pyc
+.DS_Store
