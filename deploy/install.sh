@@ -15,6 +15,9 @@ MDNS_SERVICE_TYPE="${WICI_MDNS_SERVICE_TYPE:-_wici-backend._tcp}"
 MDNS_VERSION="${WICI_MDNS_VERSION:-1}"
 MDNS_BASE_PATH="${WICI_MDNS_BASE_PATH:-/}"
 AVAHI_SERVICE_FILE="/etc/avahi/services/wici-backend.service"
+MDNS_ENV_FILE="/etc/wici/wici-mdns-health.env"
+MDNS_SCRIPT_FILE="/usr/local/bin/wici-mdns-health-advertise"
+MDNS_UNIT_FILE="/etc/systemd/system/wici-mdns-health.service"
 
 log() { printf '[wici-install] %s\n' "$*"; }
 die() { printf '[wici-install] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -119,9 +122,13 @@ ensure_nvidia_container_runtime() {
     || die "Docker GPU runtime still does not work"
 }
 
-ensure_avahi_advertisement() {
+ensure_health_gated_mdns() {
   if [[ "${MDNS_ENABLED}" == "0" ]]; then
     log "mDNS advertisement disabled by WICI_ENABLE_MDNS=0"
+    if have systemctl; then
+      require_sudo systemctl disable --now wici-mdns-health.service >/dev/null 2>&1 || true
+    fi
+    require_sudo rm -f "${AVAHI_SERVICE_FILE}" || true
     return
   fi
   [[ "$(uname -s)" == "Linux" ]] || die "Avahi mDNS install is only supported on Linux"
@@ -148,35 +155,37 @@ ensure_avahi_advertisement() {
     esac
   fi
 
+  have systemctl || die "health-gated mDNS requires systemd"
+  [[ -x "${DEPLOY_DIR}/avahi/health-advertise.sh" ]] || die "missing ${DEPLOY_DIR}/avahi/health-advertise.sh"
+  [[ -f "${DEPLOY_DIR}/avahi/wici-mdns-health.service" ]] || die "missing ${DEPLOY_DIR}/avahi/wici-mdns-health.service"
+
+  require_sudo install -d -m 0755 /etc/wici
+  require_sudo install -d -m 0755 /etc/avahi/services
+
   local tmp
   tmp="$(mktemp)"
   cat > "${tmp}" <<EOF
-<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="yes">WiCi Backend on %h</name>
-  <service>
-    <type>${MDNS_SERVICE_TYPE}</type>
-    <port>${BACKEND_PORT}</port>
-    <txt-record>version=${MDNS_VERSION}</txt-record>
-    <txt-record>base=${MDNS_BASE_PATH}</txt-record>
-  </service>
-</service-group>
+WICI_BACKEND_PORT=${BACKEND_PORT}
+WICI_MDNS_HEALTH_URL=http://127.0.0.1:${BACKEND_PORT}/orbit/health
+WICI_MDNS_SERVICE_FILE=${AVAHI_SERVICE_FILE}
+WICI_MDNS_SERVICE_TYPE=${MDNS_SERVICE_TYPE}
+WICI_MDNS_VERSION=${MDNS_VERSION}
+WICI_MDNS_BASE_PATH=${MDNS_BASE_PATH}
+WICI_MDNS_POLL_SECONDS=${WICI_MDNS_POLL_SECONDS:-10}
 EOF
-  require_sudo install -d -m 0755 /etc/avahi/services
-  require_sudo install -m 0644 "${tmp}" "${AVAHI_SERVICE_FILE}"
+  require_sudo install -m 0644 "${tmp}" "${MDNS_ENV_FILE}"
   rm -f "${tmp}"
+  require_sudo install -m 0755 "${DEPLOY_DIR}/avahi/health-advertise.sh" "${MDNS_SCRIPT_FILE}"
+  require_sudo install -m 0644 "${DEPLOY_DIR}/avahi/wici-mdns-health.service" "${MDNS_UNIT_FILE}"
 
-  if have systemctl; then
-    require_sudo systemctl enable --now avahi-daemon
-    require_sudo systemctl restart avahi-daemon
-  elif have service; then
-    require_sudo service avahi-daemon restart
-  else
-    die "cannot start avahi-daemon; systemctl or service is required"
-  fi
+  require_sudo rm -f "${AVAHI_SERVICE_FILE}"
+  require_sudo systemctl enable --now avahi-daemon
+  require_sudo systemctl daemon-reload
+  require_sudo systemctl enable wici-mdns-health.service >/dev/null
+  require_sudo systemctl restart wici-mdns-health.service
 
-  log "advertising ${MDNS_SERVICE_TYPE} on tcp/${BACKEND_PORT} via ${AVAHI_SERVICE_FILE}"
+  log "installed health-gated mDNS advertiser for ${MDNS_SERVICE_TYPE} on tcp/${BACKEND_PORT}"
+  log "advertisement is present only while http://127.0.0.1:${BACKEND_PORT}/orbit/health returns ok"
 }
 
 write_env_file() {
@@ -217,6 +226,11 @@ lan_ip() {
 }
 
 main() {
+  if [[ "${1:-}" == "--mdns-only" ]]; then
+    ensure_health_gated_mdns
+    return
+  fi
+
   log "repo: ${REPO_ROOT}"
   log "model dir: ${MODEL_DIR}"
   log "disk preflight requires ${REQUIRED_DISK_GB} GiB free: about 32 GiB Docker image + about 35 GiB weights + margin"
@@ -234,7 +248,7 @@ main() {
 
   log "starting services"
   compose up -d orbit difix flux caddy
-  ensure_avahi_advertisement
+  ensure_health_gated_mdns
 
   ip_addr="$(lan_ip)"
   [[ -n "${ip_addr}" ]] || ip_addr="127.0.0.1"

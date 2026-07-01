@@ -21,10 +21,13 @@ Draft files:
 - `gpu-preflight.sh` checks `nvidia-smi`, driver/CUDA, VRAM, compute capability,
   and at least 80 GiB free disk.
 - `install.sh` runs preflight, checks or installs Docker/toolkit, builds the
-  image, downloads weights, starts compose, installs host-side Avahi discovery,
-  and prints the LAN URL.
-- `avahi/wici-backend.service` advertises `_wici-backend._tcp` on port `54228`
-  for Android NSD discovery.
+  image, downloads weights, starts compose, installs host-side health-gated
+  Avahi discovery, and prints the LAN URL.
+- `avahi/health-advertise.sh` and `avahi/wici-mdns-health.service` install a
+  host-side mDNS gate. The gate advertises `_wici-backend._tcp` on port `54228`
+  only while `http://127.0.0.1:54228/orbit/health` returns `ok`; it removes the
+  Avahi service file when orbit is down so Android NSD does not discover a dead
+  Caddy route.
 - `scripts/download_weights.py` downloads SHARP, Difix, FLUX, and FLUX text
   encoder weights into the model volume.
 - `scripts/start-service.sh` applies the env flags observed on vast and starts
@@ -71,6 +74,11 @@ Known draft risks:
 - mDNS discovery requires `avahi-daemon` on Linux and a LAN that permits
   multicast DNS. Guest Wi-Fi, client/AP isolation, and some WSL2 networking
   modes can prevent Android NSD from seeing the service.
+- The mDNS advertiser is deliberately health-gated on orbit rather than always
+  on. If orbit is deliberately stopped with `docker compose stop orbit`, the
+  `_wici-backend._tcp` record is withdrawn; when orbit is started and healthy
+  again, the record reappears. To reinstall only this host-side gate without
+  rebuilding images or starting GPU services, run `deploy/install.sh --mdns-only`.
 - Windows Docker Desktop with WSL2 needs separate mDNS advertisement handling
   because Avahi inside WSL2 is not always visible on the physical LAN.
 - Running `avahi-browse` on the backend host can also show Docker bridge/veth

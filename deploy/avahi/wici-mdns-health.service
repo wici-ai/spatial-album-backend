@@ -1,0 +1,14 @@
+[Unit]
+Description=WiCi backend health-gated mDNS advertiser
+After=network-online.target avahi-daemon.service
+Wants=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/wici/wici-mdns-health.env
+ExecStart=/usr/local/bin/wici-mdns-health-advertise
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
