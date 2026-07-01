@@ -1,7 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+log() { printf '[wici-install] %s\n' "$*"; }
+die() { printf '[wici-install] ERROR: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_repo_deploy_dir() {
+  local candidate="${1:-}"
+  [[ -n "${candidate}" ]] || return 1
+  [[ -f "${candidate}/docker-compose.yml" ]] || return 1
+  [[ -f "${candidate}/Dockerfile.backend" ]] || return 1
+  [[ -x "${candidate}/gpu-preflight.sh" ]] || return 1
+  [[ -f "${candidate}/../backend/orbit_preview_endpoint.py" ]] || return 1
+}
+
+bootstrap_from_remote() {
+  [[ "${WICI_INSTALL_BOOTSTRAPPED:-0}" != "1" ]] \
+    || die "bootstrap re-entry did not land in a spatial-album-backend checkout"
+
+  have git || die "git is required for the one-line installer. Install git, then rerun."
+
+  local repo_url="${WICI_INSTALL_REPO_URL:-https://github.com/wici-ai/spatial-album-backend.git}"
+  local target_dir="${WICI_INSTALL_DIR:-${HOME}/spatial-album-backend}"
+  local parent_dir
+  parent_dir="$(dirname "${target_dir}")"
+  mkdir -p "${parent_dir}"
+
+  if [[ -d "${target_dir}/.git" ]]; then
+    log "updating existing checkout at ${target_dir}"
+    git -C "${target_dir}" fetch origin main
+    git -C "${target_dir}" checkout main
+    git -C "${target_dir}" pull --ff-only --recurse-submodules origin main
+    git -C "${target_dir}" submodule update --init --recursive
+  elif [[ -e "${target_dir}" ]]; then
+    if [[ -d "${target_dir}" && -z "$(find "${target_dir}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      log "cloning ${repo_url} into empty directory ${target_dir}"
+      git clone --recurse-submodules --branch main "${repo_url}" "${target_dir}"
+    else
+      die "${target_dir} already exists and is not a spatial-album-backend git checkout. Set WICI_INSTALL_DIR to another path."
+    fi
+  else
+    log "cloning ${repo_url} into ${target_dir}"
+    git clone --recurse-submodules --branch main "${repo_url}" "${target_dir}"
+  fi
+
+  local deploy_dir="${target_dir}/deploy"
+  is_repo_deploy_dir "${deploy_dir}" || die "cloned checkout is missing deploy assets at ${deploy_dir}"
+  cd "${deploy_dir}"
+  log "running installer from ${deploy_dir}"
+  exec env WICI_INSTALL_BOOTSTRAPPED=1 bash ./install.sh "$@"
+}
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-${0}}"
+DEPLOY_DIR=""
+if [[ -n "${SCRIPT_SOURCE}" && -f "${SCRIPT_SOURCE}" ]]; then
+  DEPLOY_DIR="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
+fi
+
+if ! is_repo_deploy_dir "${DEPLOY_DIR}"; then
+  bootstrap_from_remote "$@"
+fi
+
 REPO_ROOT="$(cd "${DEPLOY_DIR}/.." && pwd)"
 MODEL_DIR="${WICI_MODEL_DIR:-${HOME}/.cache/wici-form1/models}"
 RUNTIME_DIR="${WICI_RUNTIME_DIR:-${HOME}/.cache/wici-form1/runtime}"
@@ -19,9 +78,6 @@ MDNS_ENV_FILE="/etc/wici/wici-mdns-health.env"
 MDNS_SCRIPT_FILE="/usr/local/bin/wici-mdns-health-advertise"
 MDNS_UNIT_FILE="/etc/systemd/system/wici-mdns-health.service"
 
-log() { printf '[wici-install] %s\n' "$*"; }
-die() { printf '[wici-install] ERROR: %s\n' "$*" >&2; exit 1; }
-have() { command -v "$1" >/dev/null 2>&1; }
 is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
 
 compose() {

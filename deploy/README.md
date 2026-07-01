@@ -11,6 +11,25 @@ Target:
 - Windows through Docker Desktop with WSL2 GPU passthrough. Run `install.sh`
   inside WSL after Docker Desktop WSL integration is enabled.
 
+Install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wici-ai/spatial-album-backend/main/deploy/install.sh | bash
+```
+
+The one-line installer clones or updates
+`${WICI_INSTALL_DIR:-$HOME/spatial-album-backend}`, initializes submodules,
+reruns the local `deploy/install.sh`, then performs the normal GPU preflight,
+Docker setup, model download, compose startup, and health-gated mDNS install.
+
+Manual clone alternative:
+
+```bash
+git clone --recurse-submodules https://github.com/wici-ai/spatial-album-backend.git
+cd spatial-album-backend/deploy
+./install.sh
+```
+
 Draft files:
 
 - `Dockerfile.backend` builds one CUDA 12.8 image with three venvs:
