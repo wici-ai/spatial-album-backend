@@ -108,12 +108,17 @@ fi
 check_file "SHARP checkpoint" "${MODEL_DIR}/torch/hub/checkpoints/sharp_2572gikvuh.pt" 2000000000
 
 difix_cache="${MODEL_DIR}/huggingface/hub/models--nvidia--difix_ref"
-if [[ -d "${difix_cache}" ]] \
-  && find -L "${difix_cache}/snapshots" -type f -name model_index.json -size +0c -print -quit 2>/dev/null | grep -q . \
-  && find -L "${difix_cache}/snapshots" -type f -name '*.safetensors' -size +1000000c -print -quit 2>/dev/null | grep -q .; then
-  pass "DiFix Hugging Face snapshot is present: ${difix_cache}"
+difix_ref="${difix_cache}/refs/main"
+difix_revision="$(cat "${difix_ref}" 2>/dev/null || true)"
+difix_ref_bytes="$(stat -c '%s' "${difix_ref}" 2>/dev/null || printf '0')"
+difix_snapshot="${difix_cache}/snapshots/${difix_revision}"
+if [[ "${difix_ref_bytes}" == "40" && "${difix_revision}" =~ ^[0-9a-f]{40}$ ]] \
+  && [[ -d "${difix_snapshot}" ]] \
+  && find -L "${difix_snapshot}" -type f -name model_index.json -size +0c -print -quit 2>/dev/null | grep -q . \
+  && find -L "${difix_snapshot}" -type f -name '*.safetensors' -size +1000000c -print -quit 2>/dev/null | grep -q .; then
+  pass "DiFix Hugging Face snapshot is present: ${difix_revision}"
 else
-  fail "DiFix Hugging Face snapshot is missing or incomplete: ${difix_cache}"
+  fail "DiFix Hugging Face main ref or snapshot is missing or incomplete: ${difix_cache}"
 fi
 
 check_file "DiFix source photo" "${MODEL_DIR}/difix/source_photo_original.jpg" 10000
