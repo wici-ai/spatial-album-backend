@@ -39,6 +39,10 @@ Draft files:
   local port `54228`.
 - `gpu-preflight.sh` checks `nvidia-smi`, driver/CUDA, VRAM, compute capability,
   and at least 80 GiB free disk.
+- `spatial-preflight.sh` performs a read-only installed-state check for the
+  backend image, Compose/Caddy inputs, NVIDIA runtime, model artifacts, and the
+  backend port. It is safe for the profile control manager to call before it
+  stops another GPU workload.
 - `install.sh` runs preflight, checks or installs Docker/toolkit, builds the
   image, downloads weights, starts compose, installs host-side health-gated
   Avahi discovery, and prints the LAN URL.
