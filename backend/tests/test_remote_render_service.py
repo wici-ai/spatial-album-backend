@@ -181,9 +181,9 @@ class ManagerTest(unittest.TestCase):
 
     def test_superseded_waiter_does_not_call_engine(self) -> None:
         render_lock = threading.Lock()
-        render_lock.acquire()
         manager = SessionManager(self.engine, clock=self.clock, token=lambda: "latest_token", render_lock=render_lock)
         session_id = manager.create_gallery("one")["sessionId"]
+        render_lock.acquire()
         errors: list[ProtocolError] = []
 
         def invoke(request_id: int) -> None:

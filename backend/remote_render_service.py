@@ -216,7 +216,10 @@ class SessionManager:
             if session.released:
                 return
             session.released = True
-        self.engine.release(session.resource.handle)
+        # Creation, rendering, and destruction all share the adapter's one
+        # resource lock.  For Orbit this is the process-wide CUDA lock.
+        with self.render_lock:
+            self.engine.release(session.resource.handle)
 
     def _prune_locked(self, now: float) -> list[_Session]:
         for session_id, expired_at in list(self._tombstones.items()):
@@ -257,7 +260,8 @@ class SessionManager:
             if len(self._sessions) >= self.limits.max_sessions:
                 raise ProtocolError(HTTPStatus.TOO_MANY_REQUESTS, "session_capacity", "session capacity reached", retryable=True)
         try:
-            resource = factory()
+            with self.render_lock:
+                resource = factory()
         except ProtocolError:
             raise
         except Exception as exc:
@@ -452,6 +456,16 @@ class SessionManager:
         for old in releases:
             self._release(old)
 
+    def public_stats(self) -> dict[str, int]:
+        """Return bounded anonymous health data without resource identities."""
+
+        with self._lock:
+            return {
+                "activeSessions": len(self._sessions),
+                "maxSessions": self.limits.max_sessions,
+                "recentExpiredSessions": len(self._tombstones),
+            }
+
 
 def parse_gallery_create(value: Any) -> str:
     body = _object(value, "body")
@@ -547,93 +561,119 @@ def parse_multipart(content_type: str, body: bytes, limits: Limits) -> tuple[byt
     return image
 
 
-def make_handler(manager: SessionManager) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "WiCiRemoteRender/1"
+class RemoteRouteMixin:
+    """CPU-safe HTTP route adapter shared by Orbit and the test harness."""
 
-        def log_message(self, format: str, *args: Any) -> None:
-            return
+    def _remote_json(self, status: int, payload: Mapping[str, Any]) -> None:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST,DELETE,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(data)
 
-        def _json(self, status: int, payload: Mapping[str, Any]) -> None:
-            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+    def _remote_error(self, error: ProtocolError) -> None:
+        self._remote_json(error.status, error.payload())
 
-        def _error(self, error: ProtocolError) -> None:
-            self._json(error.status, error.payload())
+    def _remote_body(self, limit: int) -> bytes:
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length or "")
+        except ValueError as exc:
+            raise _bad("invalid_request", "valid Content-Length is required") from exc
+        if length < 0:
+            raise _bad("invalid_request", "valid Content-Length is required")
+        if length > limit:
+            raise ProtocolError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large", "request body exceeds limit")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            raise _bad("invalid_request", "request body is truncated")
+        return data
 
-        def _body(self, limit: int) -> bytes:
-            raw_length = self.headers.get("Content-Length")
-            try:
-                length = int(raw_length or "")
-            except ValueError as exc:
-                raise _bad("invalid_request", "valid Content-Length is required") from exc
-            if length < 0:
-                raise _bad("invalid_request", "valid Content-Length is required")
-            if length > limit:
-                raise ProtocolError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large", "request body exceeds limit")
-            data = self.rfile.read(length)
-            if len(data) != length:
-                raise _bad("invalid_request", "request body is truncated")
-            return data
+    def _remote_json_body(self, manager: SessionManager) -> Any:
+        if self.headers.get_content_type() != "application/json":
+            raise _bad("invalid_content_type", "Content-Type must be application/json")
+        try:
+            return json.loads(self._remote_body(manager.limits.max_json_bytes).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _bad("invalid_json", "request body must be valid UTF-8 JSON") from exc
 
-        def _json_body(self) -> Any:
-            content_type = self.headers.get_content_type()
-            if content_type != "application/json":
-                raise _bad("invalid_content_type", "Content-Type must be application/json")
-            try:
-                return json.loads(self._body(manager.limits.max_json_bytes).decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise _bad("invalid_json", "request body must be valid UTF-8 JSON") from exc
+    def dispatch_remote(self, manager: SessionManager | None, method: str) -> bool:
+        """Handle a /render route and report whether the route was claimed."""
 
-        def do_POST(self) -> None:
-            try:
-                path = urlsplit(self.path).path
+        path = urlsplit(self.path).path
+        if path != "/render/sessions" and not path.startswith("/render/sessions/"):
+            return False
+        try:
+            if manager is None:
+                raise ProtocolError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "remote_render_disabled",
+                    "remote render is disabled",
+                    retryable=False,
+                )
+            if method == "POST":
                 if path == "/render/sessions":
                     if self.headers.get_content_type() == "multipart/form-data":
-                        body = self._body(manager.limits.max_upload_bytes + manager.limits.max_json_bytes)
+                        body = self._remote_body(manager.limits.max_upload_bytes + manager.limits.max_json_bytes)
                         image, filename, content_type = parse_multipart(self.headers.get("Content-Type", ""), body, manager.limits)
                         payload = manager.create_upload(image, filename, content_type)
                     else:
-                        payload = manager.create_gallery(parse_gallery_create(self._json_body()))
-                    self._json(HTTPStatus.CREATED, payload)
-                    return
+                        payload = manager.create_gallery(parse_gallery_create(self._remote_json_body(manager)))
+                    self._remote_json(HTTPStatus.CREATED, payload)
+                    return True
                 prefix, suffix = "/render/sessions/", "/frames"
                 if path.startswith(prefix) and path.endswith(suffix):
                     session_id = path[len(prefix) : -len(suffix)]
                     if not session_id or "/" in session_id:
                         raise ProtocolError(HTTPStatus.NOT_FOUND, "route_not_found", "route not found")
-                    mime, data, headers = manager.render(session_id, self._json_body())
+                    mime, data, headers = manager.render(session_id, self._remote_json_body(manager))
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", mime)
                     self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Access-Control-Expose-Headers", ", ".join(headers))
                     for name, value in headers.items():
                         self.send_header(name, value)
                     self.end_headers()
                     self.wfile.write(data)
-                    return
-                raise ProtocolError(HTTPStatus.NOT_FOUND, "route_not_found", "route not found")
-            except ProtocolError as error:
-                self._error(error)
-            except Exception:
-                self._error(ProtocolError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error", "internal server error", retryable=True))
+                    return True
+            elif method == "DELETE":
+                prefix = "/render/sessions/"
+                if path.startswith(prefix) and "/" not in path[len(prefix) :] and path[len(prefix) :]:
+                    manager.delete(path[len(prefix) :])
+                    self.send_response(HTTPStatus.NO_CONTENT)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    return True
+            raise ProtocolError(HTTPStatus.NOT_FOUND, "route_not_found", "route not found")
+        except ProtocolError as error:
+            self._remote_error(error)
+        except Exception:
+            self._remote_error(ProtocolError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error", "internal server error", retryable=True))
+        return True
+
+
+def make_handler(manager: SessionManager) -> type[BaseHTTPRequestHandler]:
+    class Handler(RemoteRouteMixin, BaseHTTPRequestHandler):
+        server_version = "WiCiRemoteRender/1"
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:
+            if not self.dispatch_remote(manager, "POST"):
+                self._remote_error(ProtocolError(HTTPStatus.NOT_FOUND, "route_not_found", "route not found"))
 
         def do_DELETE(self) -> None:
-            try:
-                path = urlsplit(self.path).path
-                prefix = "/render/sessions/"
-                if not path.startswith(prefix) or "/" in path[len(prefix) :] or not path[len(prefix) :]:
-                    raise ProtocolError(HTTPStatus.NOT_FOUND, "route_not_found", "route not found")
-                manager.delete(path[len(prefix) :])
-                self.send_response(HTTPStatus.NO_CONTENT)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-            except ProtocolError as error:
-                self._error(error)
+            if not self.dispatch_remote(manager, "DELETE"):
+                self._remote_error(ProtocolError(HTTPStatus.NOT_FOUND, "route_not_found", "route not found"))
 
     return Handler
 

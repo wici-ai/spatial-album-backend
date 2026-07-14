@@ -34,6 +34,31 @@ from plyfile import PlyData
 
 from gsplat.rendering import rasterization
 
+try:
+    from .remote_render_service import (
+        CAMERA_CONVENTION,
+        PROTOCOL as REMOTE_RENDER_PROTOCOL,
+        Camera as RemoteCamera,
+        Limits as RemoteLimits,
+        ProtocolError as RemoteProtocolError,
+        RemoteRouteMixin,
+        RenderedFrame as RemoteRenderedFrame,
+        SessionManager as RemoteSessionManager,
+        SessionResource as RemoteSessionResource,
+    )
+except ImportError:  # Direct script execution from backend/.
+    from remote_render_service import (  # type: ignore[no-redef]
+        CAMERA_CONVENTION,
+        PROTOCOL as REMOTE_RENDER_PROTOCOL,
+        Camera as RemoteCamera,
+        Limits as RemoteLimits,
+        ProtocolError as RemoteProtocolError,
+        RemoteRouteMixin,
+        RenderedFrame as RemoteRenderedFrame,
+        SessionManager as RemoteSessionManager,
+        SessionResource as RemoteSessionResource,
+    )
+
 
 VIEWER_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = VIEWER_ROOT.parent
@@ -79,6 +104,15 @@ INGEST_MAX_PIXELS = int(float(os.environ.get("WICI_INGEST_MAX_PIXELS", "16000000
 INGEST_MIN_FREE_BYTES = int(float(os.environ.get("WICI_INGEST_MIN_FREE_GB", "10")) * 1024 * 1024 * 1024)
 INGEST_JPEG_QUALITY = int(os.environ.get("WICI_INGEST_JPEG_QUALITY", "92"))
 INGEST_SHARP_TIMEOUT_SECONDS = float(os.environ.get("WICI_INGEST_SHARP_TIMEOUT_SECONDS", "180"))
+REMOTE_RENDER_ENABLED = os.environ.get("WICI_REMOTE_RENDER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+REMOTE_INTERACTIVE_JPEG_QUALITY = int(os.environ.get("WICI_REMOTE_INTERACTIVE_JPEG_QUALITY", "82"))
+REMOTE_CAPTURE_JPEG_QUALITY = int(os.environ.get("WICI_REMOTE_CAPTURE_JPEG_QUALITY", "92"))
+REMOTE_LIMITS = RemoteLimits(
+    max_sessions=int(os.environ.get("WICI_REMOTE_MAX_SESSIONS", "4")),
+    idle_ttl_seconds=float(os.environ.get("WICI_REMOTE_SESSION_TTL_SECONDS", "120")),
+    max_frame_pixels=int(os.environ.get("WICI_REMOTE_MAX_FRAME_PIXELS", str(1280 * 1280))),
+    max_upload_bytes=int(float(os.environ.get("WICI_REMOTE_MAX_UPLOAD_MB", "20")) * 1024 * 1024),
+)
 SPLAT_STREAM_SHUFFLE_SEED = int(os.environ.get("WICI_SPLAT_STREAM_SHUFFLE_SEED", "1337"))
 SH_C0 = 0.28209479177387814
 SPLAT_ROW_BYTES = 32
@@ -130,6 +164,14 @@ class LoadedAsset:
     last_used: float
 
 
+@dataclass
+class RemoteAssetHandle:
+    """Session-owned tensor bundle; never placed in the legacy asset cache."""
+
+    asset: LoadedAsset | None
+    released: bool = False
+
+
 @dataclass(frozen=True)
 class RenderParams:
     width: int
@@ -168,7 +210,7 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, data: Any) -> No
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(raw)))
     handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    handler.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", f"Content-Type, {INGEST_COMPACT_ACCEPT_HEADER}, {INGEST_COMPACT_STREAM_HEADER}")
     handler.send_header("Cross-Origin-Resource-Policy", "cross-origin")
     handler.end_headers()
@@ -2255,6 +2297,218 @@ def loaded_asset_from_inproc_gaussians(spec: AssetSpec, gaussians: Any) -> Loade
     )
 
 
+def load_remote_gallery_asset(spec: AssetSpec) -> LoadedAsset:
+    """Load an uncached tensor bundle whose lifetime belongs to one session."""
+
+    started = time.perf_counter()
+    if spec.kind == "splat":
+        means_np, quats_np, scales_np, opacities_np, colors_np = load_splat_arrays(spec.path)
+    elif spec.kind == "ply":
+        means_np, quats_np, scales_np, opacities_np, colors_np = load_ply_arrays(spec.path)
+    else:
+        raise ValueError(f"unsupported asset kind {spec.kind}")
+    asset = LoadedAsset(
+        spec=spec,
+        means=torch.from_numpy(means_np).to("cuda", non_blocking=True),
+        quats=torch.from_numpy(quats_np).to("cuda", non_blocking=True),
+        scales=torch.from_numpy(scales_np).to("cuda", non_blocking=True),
+        opacities=torch.from_numpy(opacities_np).to("cuda", non_blocking=True),
+        colors_linear=torch.from_numpy(colors_np).to("cuda", non_blocking=True),
+        count=int(means_np.shape[0]),
+        loaded_seconds=0.0,
+        last_used=time.time(),
+    )
+    torch.cuda.synchronize()
+    asset.loaded_seconds = time.perf_counter() - started
+    return asset
+
+
+def remote_camera_for_spec(spec: AssetSpec) -> RemoteCamera:
+    width, height = DEFAULT_WIDTH, DEFAULT_HEIGHT
+    scale = max(width / spec.source_width, height / spec.source_height)
+    k = spec.k_source.copy()
+    k[0, :] *= scale
+    k[1, :] *= scale
+    k[0, 2] -= (spec.source_width * scale - width) * 0.5
+    k[1, 2] -= (spec.source_height * scale - height) * 0.5
+    initial_w2c = viewmat_for_offset(0.0, 0.0).reshape(-1)
+    return RemoteCamera(
+        convention=CAMERA_CONVENTION,
+        w2c=tuple(float(value) for value in initial_w2c),
+        fx=float(k[0, 0]),
+        fy=float(k[1, 1]),
+        cx=float(k[0, 2]),
+        cy=float(k[1, 2]),
+        width=width,
+        height=height,
+    )
+
+
+def remote_resource(asset: LoadedAsset) -> RemoteSessionResource:
+    return RemoteSessionResource(
+        handle=RemoteAssetHandle(asset),
+        initial_camera=remote_camera_for_spec(asset.spec),
+        pivot=(0.0, 0.0, 1.0),
+        focus_distance=1.0,
+        source_width=asset.spec.source_width,
+        source_height=asset.spec.source_height,
+    )
+
+
+def encode_remote_image(array: np.ndarray, image_format: str, *, quality: int | None = None) -> bytes:
+    output = io.BytesIO()
+    image = Image.fromarray(array)
+    save_options: dict[str, Any] = {}
+    if quality is not None:
+        save_options.update(quality=quality, optimize=True)
+    image.save(output, format=image_format, **save_options)
+    return output.getvalue()
+
+
+class OrbitRemoteRenderEngine:
+    """Maps remote-render-v1 resources to Orbit's existing gsplat pipeline."""
+
+    def create_gallery(self, photo_id: str) -> RemoteSessionResource:
+        try:
+            # Only photoId crosses this boundary; direct path/splat parameters
+            # are intentionally impossible on the remote session route.
+            spec = resolve_asset({"photoId": [photo_id]})
+            return remote_resource(load_remote_gallery_asset(spec))
+        except FileNotFoundError as exc:
+            raise RemoteProtocolError(404, "asset_not_found", "gallery asset not found") from exc
+        except RemoteProtocolError:
+            raise
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RemoteProtocolError(503, "gpu_out_of_memory", "GPU memory exhausted", retryable=True) from exc
+        except (ValueError, OSError) as exc:
+            raise RemoteProtocolError(400, "invalid_source", "gallery source is invalid") from exc
+        except RuntimeError as exc:
+            raise self._runtime_error(exc) from exc
+
+    def create_upload(self, image: bytes, filename: str, content_type: str) -> RemoteSessionResource:
+        if not ORBIT_INPROC_SHARP:
+            raise RemoteProtocolError(
+                503,
+                "sharp_unavailable",
+                "in-process SHARP is required for upload sessions",
+                retryable=False,
+            )
+        try:
+            with Image.open(io.BytesIO(image)) as decoded:
+                decoded = ImageOps.exif_transpose(decoded)
+                width, height = decoded.size
+                if width <= 0 or height <= 0 or width * height > INGEST_MAX_PIXELS:
+                    raise ValueError("upload image dimensions exceed limits")
+                decoded = decoded.convert("RGB")
+                longest = max(width, height)
+                if longest > INGEST_MAX_SOURCE_SIDE:
+                    scale = INGEST_MAX_SOURCE_SIDE / float(longest)
+                    decoded = decoded.resize(
+                        (max(1, round(width * scale)), max(1, round(height * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+            with tempfile.TemporaryDirectory(prefix="wici-remote-render-") as temp_dir:
+                source_path = Path(temp_dir) / "source.jpg"
+                decoded.save(source_path, format="JPEG", quality=INGEST_JPEG_QUALITY, optimize=True)
+                gaussians, meta = predict_inproc_sharp_gaussians(source_path)
+            source_width = int(meta["sourceWidth"])
+            source_height = int(meta["sourceHeight"])
+            spec = AssetSpec(
+                path=Path("remote-upload"),
+                kind="inproc",
+                source_width=source_width,
+                source_height=source_height,
+                k_source=np.array(
+                    [
+                        [float(meta["camFx"]), 0.0, float(meta["camCx"])],
+                        [0.0, float(meta["camFy"]), float(meta["camCy"])],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                photo_id=None,
+                title=Path(filename).stem,
+            )
+            return remote_resource(loaded_asset_from_inproc_gaussians(spec, gaussians))
+        except RemoteProtocolError:
+            raise
+        except (Image.UnidentifiedImageError, ValueError, OSError) as exc:
+            raise RemoteProtocolError(400, "invalid_source", "uploaded image is invalid") from exc
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RemoteProtocolError(503, "gpu_out_of_memory", "GPU memory exhausted", retryable=True) from exc
+        except RuntimeError as exc:
+            raise self._runtime_error(exc) from exc
+
+    def render(self, handle: RemoteAssetHandle, camera: RemoteCamera, mode: str) -> RemoteRenderedFrame:
+        if handle.released or handle.asset is None:
+            raise RemoteProtocolError(410, "session_expired", "session resource was released")
+        asset = handle.asset
+        try:
+            with torch.inference_mode():
+                view = torch.tensor(camera.w2c, dtype=torch.float32, device="cuda").reshape(1, 4, 4)
+                k = torch.tensor(
+                    [[camera.fx, 0.0, camera.cx], [0.0, camera.fy, camera.cy], [0.0, 0.0, 1.0]],
+                    dtype=torch.float32,
+                    device="cuda",
+                )[None]
+                colors, alphas, _ = rasterization(
+                    means=asset.means,
+                    quats=asset.quats,
+                    scales=asset.scales,
+                    opacities=asset.opacities,
+                    colors=asset.colors_linear,
+                    viewmats=view,
+                    Ks=k,
+                    width=camera.width,
+                    height=camera.height,
+                    render_mode="RGB",
+                    rasterize_mode="classic",
+                    packed=False,
+                    absgrad=False,
+                )
+                seed_linear = colors[0, ..., :3].clamp(0.0, 1.0)
+                alpha = alphas[0, ..., :1].clamp(0.0, 1.0)
+                bg_rgb = np.array(ImageColor.getrgb(f"#{DEFAULT_BG_HEX}"), dtype=np.float32) / 255.0
+                bg_linear = torch.from_numpy(srgb_to_linear_np(bg_rgb)).to(seed_linear.device)
+                preview_linear = seed_linear + (1.0 - alpha) * bg_linear[None, None, :]
+                seed = (linear_to_srgb_torch(seed_linear).clamp(0.0, 1.0) * 255.0).round().byte().cpu().numpy()
+                preview = (linear_to_srgb_torch(preview_linear).clamp(0.0, 1.0) * 255.0).round().byte().cpu().numpy()
+                alpha_u8 = (alpha[..., 0] * 255.0).round().byte().cpu().numpy()
+            preview_jpeg = encode_remote_image(
+                preview,
+                "JPEG",
+                quality=REMOTE_CAPTURE_JPEG_QUALITY if mode == "capture" else REMOTE_INTERACTIVE_JPEG_QUALITY,
+            )
+            return RemoteRenderedFrame(
+                preview_jpeg=preview_jpeg,
+                width=camera.width,
+                height=camera.height,
+                seed_jpeg=encode_remote_image(seed, "JPEG", quality=REMOTE_CAPTURE_JPEG_QUALITY) if mode == "capture" else None,
+                alpha_png=encode_remote_image(alpha_u8, "PNG") if mode == "capture" else None,
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RemoteProtocolError(503, "gpu_out_of_memory", "GPU memory exhausted", retryable=True) from exc
+        except RuntimeError as exc:
+            raise self._runtime_error(exc) from exc
+
+    def release(self, handle: RemoteAssetHandle) -> None:
+        if handle.released:
+            return
+        handle.released = True
+        handle.asset = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _runtime_error(exc: RuntimeError) -> RemoteProtocolError:
+        message = str(exc).lower()
+        if "out of memory" in message:
+            return RemoteProtocolError(503, "gpu_out_of_memory", "GPU memory exhausted", retryable=True)
+        if "cuda" in message:
+            return RemoteProtocolError(503, "gpu_unavailable", "CUDA render engine unavailable", retryable=True)
+        return RemoteProtocolError(503, "render_unavailable", "render engine unavailable", retryable=True)
+
+
 def run_inproc_sharp_startup_warmup() -> None:
     if not ORBIT_INPROC_SHARP:
         return
@@ -2542,7 +2796,14 @@ def run_ingest_preview(upload: IngestUpload, params: dict[str, list[str]]) -> tu
     return data, meta
 
 
-class Handler(BaseHTTPRequestHandler):
+_remote_render_manager: RemoteSessionManager | None = (
+    RemoteSessionManager(OrbitRemoteRenderEngine(), limits=REMOTE_LIMITS, render_lock=_lock)
+    if REMOTE_RENDER_ENABLED
+    else None
+)
+
+
+class Handler(RemoteRouteMixin, BaseHTTPRequestHandler):
     server_version = "WiCiOrbitPreview/1.0"
     protocol_version = "HTTP/1.1"
 
@@ -2559,6 +2820,11 @@ class Handler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         if route == "/health":
+            remote_stats = _remote_render_manager.public_stats() if _remote_render_manager is not None else {
+                "activeSessions": 0,
+                "maxSessions": REMOTE_LIMITS.max_sessions,
+                "recentExpiredSessions": 0,
+            }
             json_response(
                 self,
                 200,
@@ -2568,6 +2834,14 @@ class Handler(BaseHTTPRequestHandler):
                     "torch": torch.__version__,
                     "cudaVersion": torch.version.cuda,
                     "gsplat": "available",
+                    "capabilities": [REMOTE_RENDER_PROTOCOL] if _remote_render_manager is not None else [],
+                    "remoteRender": {
+                        "enabled": _remote_render_manager is not None,
+                        "protocol": REMOTE_RENDER_PROTOCOL,
+                        "cameraConvention": CAMERA_CONVENTION,
+                        "limits": REMOTE_LIMITS.public(),
+                        "sessions": remote_stats,
+                    },
                     "cacheDir": str(CACHE_DIR),
                     "userRoot": str(PHOTOS_USER_ROOT),
                     "userGalleryCount": len(load_user_gallery()),
@@ -2780,6 +3054,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         global _last_ingest, _last_preview
+        if self.dispatch_remote(_remote_render_manager, "POST"):
+            return
         request_start = time.perf_counter()
         parsed = urlparse(self.path)
         route = parsed.path
@@ -2900,6 +3176,11 @@ class Handler(BaseHTTPRequestHandler):
                     "diskFreeBytes": disk_free_bytes(VIEWER_ROOT),
                 },
             )
+
+    def do_DELETE(self) -> None:
+        if self.dispatch_remote(_remote_render_manager, "DELETE"):
+            return
+        json_response(self, 404, {"ok": False, "error": "not_found"})
 
 
 class Server(ThreadingHTTPServer):
