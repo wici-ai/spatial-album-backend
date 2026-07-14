@@ -56,6 +56,39 @@ Draft files:
 - `scripts/start-service.sh` applies the env flags observed on vast and starts
   the selected endpoint.
 
+Remote interactive rendering uses the existing Caddy listener: public
+`/orbit/render/...` requests are prefix-stripped to Orbit's internal
+`/render/...` routes. No additional host port is opened. Android local mode
+continues to download and render the splat; remote mode creates a backend
+session and receives interactive JPEG frames or a capture package without
+downloading the complete splat.
+
+Remote-session defaults (also listed in `.env.example`) are:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `WICI_REMOTE_RENDER_ENABLED` | `1` | Advertise and serve `remote-render-v1`; set `0` to disable. |
+| `WICI_REMOTE_MAX_SESSIONS` | `4` | Maximum simultaneous GPU-resident sessions. |
+| `WICI_REMOTE_SESSION_TTL_SECONDS` | `120` | Idle time before server reclamation. |
+| `WICI_REMOTE_MAX_FRAME_PIXELS` | `1638400` | Maximum requested width times height. |
+| `WICI_REMOTE_MAX_UPLOAD_MB` | `20` | Maximum uploaded source image body. |
+| `WICI_REMOTE_INTERACTIVE_JPEG_QUALITY` | `82` | Interactive preview JPEG quality. |
+| `WICI_REMOTE_CAPTURE_JPEG_QUALITY` | `92` | Capture preview and seed JPEG quality; alpha remains PNG. |
+
+Clients should explicitly `DELETE /orbit/render/sessions/<session-id>` when a
+view closes. The TTL is a bounded fallback for disconnected clients. Raising
+session or frame limits can exhaust VRAM; raising upload or quality limits can
+increase memory, bandwidth, and latency. The `/orbit/health` response reports
+the exact protocol capability, configured public limits, and anonymous session
+counts, but never session IDs or photo paths.
+
+The first-stage tests use a fake engine on loopback and require no CUDA device.
+They validate protocol, routing, lifecycle, and configuration only. GPU image
+correctness, interaction latency, real VRAM ceilings, and concurrency remain a
+separate integration gate and have not been run for this change. The Caddy
+listener and mDNS discovery target a trusted LAN; they are not a complete
+public authentication, authorization, TLS, or multi-tenant isolation solution.
+
 The Docker image copies model code from git submodules:
 
 - `../third_party/ml-sharp`

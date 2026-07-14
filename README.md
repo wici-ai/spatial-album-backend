@@ -72,6 +72,14 @@ The proxy maps `/orbit/*` to Orbit, `/difix/*` to Difix, and `/flux/*` to
 FLUX. Caddy also keeps compatibility routes such as `/gallery`, `/source`,
 `/thumbnail`, `/splat`, `/splat_stream`, and `/orbit_preview` pointed at Orbit.
 
+Orbit also implements versioned remote interactive rendering. The app-facing
+routes are `/orbit/render/sessions` and
+`/orbit/render/sessions/<session-id>/frames`; Caddy strips `/orbit` before
+forwarding them to Orbit. This uses the existing Caddy port and does not expose
+Orbit's container port directly. Local Android rendering continues to use the
+downloaded splat path, while remote rendering keeps the splat on the backend.
+See [`docs/remote-render-v1.md`](docs/remote-render-v1.md) for the wire contract.
+
 ## Auto-Discovery
 
 The deploy installs a host-side Avahi/systemd advertiser for:
@@ -107,11 +115,37 @@ WICI_ENABLE_MDNS=1
 WICI_MDNS_SERVICE_TYPE=_wici-backend._tcp
 WICI_MDNS_VERSION=1
 WICI_MDNS_BASE_PATH=/
+WICI_REMOTE_RENDER_ENABLED=1
+WICI_REMOTE_MAX_SESSIONS=4
+WICI_REMOTE_SESSION_TTL_SECONDS=120
+WICI_REMOTE_MAX_FRAME_PIXELS=1638400
+WICI_REMOTE_MAX_UPLOAD_MB=20
+WICI_REMOTE_INTERACTIVE_JPEG_QUALITY=82
+WICI_REMOTE_CAPTURE_JPEG_QUALITY=92
 ```
 
 `install.sh` writes `deploy/.env` for Compose from the selected model/runtime
 directories and port. You can export the same variables before running the
 installer to override defaults.
+
+Remote sessions are deliberately bounded. `WICI_REMOTE_MAX_SESSIONS` limits
+concurrent GPU-resident scenes, `WICI_REMOTE_SESSION_TTL_SECONDS` reclaims idle
+sessions, and `WICI_REMOTE_MAX_FRAME_PIXELS` caps each requested frame. Clients
+should still send `DELETE /orbit/render/sessions/<session-id>` when finished;
+TTL is crash recovery, not the normal close path. Uploads and JPEG qualities
+are bounded by the remaining settings above. Increasing session count, pixel
+count, upload size, or quality can increase VRAM, host memory, bandwidth, and
+latency; measure changes on the target GPU rather than treating these defaults
+as a capacity claim. Set `WICI_REMOTE_RENDER_ENABLED=0` to omit the capability
+and reject remote session routes while retaining local-render support.
+
+The remote protocol and lifecycle tests run without a GPU using a fake engine
+bound only to loopback. That CPU validation has passed during development, but
+real GPU image correctness, latency, VRAM limits, and concurrency have not yet
+been integration-tested. This deployment is a trusted-LAN backend, not a
+completed public-internet authentication or tenant-isolation design. Do not
+publish its port to an untrusted network without adding an appropriate auth and
+transport-security boundary.
 
 FLUX.1-Fill-dev is gated on Hugging Face. The installer accepts either:
 
