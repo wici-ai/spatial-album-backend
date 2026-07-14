@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import pathlib
+import socket
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ from backend.remote_render_service import (  # noqa: E402
     RenderedFrame,
     SessionManager,
     SessionResource,
+    BodyRejectionRecord,
     loopback_server,
     parse_camera,
     parse_frame_request,
@@ -284,6 +286,14 @@ class HttpTest(unittest.TestCase):
         self.engine = FakeEngine()
         self.manager = SessionManager(self.engine, token=lambda: "http_token_01", limits=Limits(max_upload_bytes=1024))
         self.server = loopback_server(self.manager)
+        self.rejections: list[BodyRejectionRecord] = []
+        self.rejection_recorded = threading.Event()
+
+        def observe(record: BodyRejectionRecord) -> None:
+            self.rejections.append(record)
+            self.rejection_recorded.set()
+
+        self.server.remote_body_rejection_observer = observe
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
@@ -311,6 +321,128 @@ class HttpTest(unittest.TestCase):
         status, headers, data = self.request("/render/sessions", body=body)
         self.assertEqual((201, "application/json"), (status, headers.get_content_type()))
         return json.loads(data)["sessionId"]
+
+    def oversized_socket(self, declared_bytes: int) -> socket.socket:
+        connection = socket.create_connection(self.server.server_address, timeout=2)
+        connection.settimeout(2)
+        headers = (
+            "POST /render/sessions HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {declared_bytes}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        connection.sendall(headers)
+        return connection
+
+    def read_complete_response(self, connection: socket.socket) -> tuple[int, dict[str, str], bytes]:
+        wire = bytearray()
+        while b"\r\n\r\n" not in wire:
+            chunk = connection.recv(4096)
+            self.assertTrue(chunk, "connection closed before response headers completed")
+            wire.extend(chunk)
+        raw_headers, body = bytes(wire).split(b"\r\n\r\n", 1)
+        lines = raw_headers.decode("iso-8859-1").split("\r\n")
+        status = int(lines[0].split(" ", 2)[1])
+        headers = {name.lower(): value.strip() for name, value in (line.split(":", 1) for line in lines[1:])}
+        content_length = int(headers["content-length"])
+        while len(body) < content_length:
+            chunk = connection.recv(content_length - len(body))
+            self.assertTrue(chunk, "connection closed before response body completed")
+            body += chunk
+        self.assertEqual(content_length, len(body))
+        return status, headers, body
+
+    def assert_oversized_response(self, response: tuple[int, dict[str, str], bytes]) -> None:
+        status, headers, body = response
+        payload = json.loads(body)
+        self.assertEqual((413, "application/json", "no-store", "close"), (
+            status,
+            headers["content-type"],
+            headers["cache-control"],
+            headers["connection"],
+        ))
+        self.assertEqual(("body_too_large", False), (
+            payload["error"]["code"], payload["error"]["retryable"]
+        ))
+        self.assertEqual([], self.engine.created)
+
+    def test_oversized_body_full_send_returns_complete_413(self) -> None:
+        body = b"x" * (64 * 1024 + 4096)
+        connection = self.oversized_socket(len(body))
+        with connection:
+            connection.sendall(body)
+            self.assert_oversized_response(self.read_complete_response(connection))
+        self.assertTrue(self.rejection_recorded.wait(1))
+        record = self.rejections[-1]
+        self.assertEqual((len(body), len(body), "complete"), (
+            record.discarded_bytes, record.discard_budget_bytes, record.outcome
+        ))
+        self.assertTrue(record.body_complete)
+
+    def test_oversized_body_paced_send_returns_complete_413(self) -> None:
+        body = b"x" * (64 * 1024 + 4096)
+        first_chunk = 4096
+        continue_sending = threading.Event()
+        sender_errors: list[Exception] = []
+        connection = self.oversized_socket(len(body))
+        connection.sendall(body[:first_chunk])
+
+        def send_remainder() -> None:
+            continue_sending.wait(1)
+            try:
+                for offset in range(first_chunk, len(body), 4096):
+                    connection.sendall(body[offset : offset + 4096])
+                    time.sleep(0.002)
+            except Exception as exc:  # surfaced by the test thread below
+                sender_errors.append(exc)
+
+        sender = threading.Thread(target=send_remainder)
+        sender.start()
+        try:
+            # The complete 413 must be readable before the paced sender is
+            # released to finish the declared request body.
+            self.assert_oversized_response(self.read_complete_response(connection))
+            continue_sending.set()
+            sender.join(1)
+            self.assertFalse(sender.is_alive())
+            self.assertEqual([], sender_errors)
+            self.assertTrue(self.rejection_recorded.wait(1))
+        finally:
+            continue_sending.set()
+            sender.join(1)
+            connection.close()
+        record = self.rejections[-1]
+        self.assertEqual((len(body), "complete"), (record.discarded_bytes, record.outcome))
+        self.assertLessEqual(record.elapsed_seconds, 0.75)
+
+    def test_oversized_body_headers_only_does_not_wait_unbounded(self) -> None:
+        declared = 64 * 1024 + 4096
+        connection = self.oversized_socket(declared)
+        started = time.monotonic()
+        with connection:
+            self.assert_oversized_response(self.read_complete_response(connection))
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(self.rejection_recorded.wait(1))
+        record = self.rejections[-1]
+        self.assertEqual((0, False, "peer_closed"), (
+            record.discarded_bytes, record.body_complete, record.outcome
+        ))
+        self.assertLessEqual(record.elapsed_seconds, 0.75)
+
+    def test_oversized_body_discard_is_byte_bounded(self) -> None:
+        declared = 10 * 1024 * 1024
+        discard_budget = 128 * 1024
+        connection = self.oversized_socket(declared)
+        connection.sendall(b"x" * (discard_budget + 4096))
+        with connection:
+            self.assert_oversized_response(self.read_complete_response(connection))
+            self.assertTrue(self.rejection_recorded.wait(1))
+        record = self.rejections[-1]
+        self.assertEqual((discard_budget, discard_budget, "budget_exhausted"), (
+            record.discarded_bytes, record.discard_budget_bytes, record.outcome
+        ))
+        self.assertFalse(record.body_complete)
 
     def test_create_frame_headers_delete_and_structured_error(self) -> None:
         session_id = self.create()

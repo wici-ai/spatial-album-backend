@@ -10,6 +10,7 @@ import io
 import json
 import math
 import re
+import socket
 import threading
 import time
 import zipfile
@@ -26,6 +27,9 @@ PROTOCOL = "remote-render-v1"
 CAMERA_CONVENTION = "opencv-w2c-row-major-4x4"
 CAPTURE_MEMBERS = ("manifest.json", "seed.jpg", "preview.jpg", "alpha.png")
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+OVERSIZED_BODY_DISCARD_ALLOWANCE_BYTES = 64 * 1024
+OVERSIZED_BODY_DISCARD_DEADLINE_SECONDS = 0.5
+OVERSIZED_BODY_DISCARD_CHUNK_BYTES = 16 * 1024
 
 
 class ProtocolError(Exception):
@@ -56,6 +60,23 @@ class ProtocolError(Exception):
         if self.details:
             error["details"] = self.details
         return {"protocol": PROTOCOL, "error": error}
+
+
+class _OversizedBody(Exception):
+    def __init__(self, declared_bytes: int, route_limit_bytes: int) -> None:
+        self.declared_bytes = declared_bytes
+        self.route_limit_bytes = route_limit_bytes
+
+
+@dataclass(frozen=True)
+class BodyRejectionRecord:
+    declared_bytes: int
+    route_limit_bytes: int
+    discard_budget_bytes: int
+    discarded_bytes: int
+    elapsed_seconds: float
+    body_complete: bool
+    outcome: str
 
 
 def _bad(code: str, message: str, *, details: Mapping[str, Any] | None = None) -> ProtocolError:
@@ -564,8 +585,10 @@ def parse_multipart(content_type: str, body: bytes, limits: Limits) -> tuple[byt
 class RemoteRouteMixin:
     """CPU-safe HTTP route adapter shared by Orbit and the test harness."""
 
-    def _remote_json(self, status: int, payload: Mapping[str, Any]) -> None:
+    def _remote_json(self, status: int, payload: Mapping[str, Any], *, close_connection: bool = False) -> None:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if close_connection:
+            self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -573,11 +596,72 @@ class RemoteRouteMixin:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST,DELETE,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+        self.wfile.flush()
 
     def _remote_error(self, error: ProtocolError) -> None:
         self._remote_json(error.status, error.payload())
+
+    def _remote_reject_oversized_body(self, oversized: _OversizedBody) -> None:
+        """Send the stable 413 first, then own a bounded connection drain.
+
+        Closing a TCP connection with unread request bytes can replace an
+        already-written HTTP response with a reset at the client.  This policy
+        guarantees a graceful close only while the declared body fits the
+        route-derived discard budget and arrives before the fixed deadline.
+        Larger or stalled senders still consume bounded bytes and time.
+        """
+
+        error = ProtocolError(
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            "body_too_large",
+            "request body exceeds limit",
+        )
+        self._remote_json(error.status, error.payload(), close_connection=True)
+
+        declared = oversized.declared_bytes
+        budget = min(declared, oversized.route_limit_bytes + OVERSIZED_BODY_DISCARD_ALLOWANCE_BYTES)
+        discarded = 0
+        outcome = "deadline"
+        started = time.monotonic()
+        deadline = started + OVERSIZED_BODY_DISCARD_DEADLINE_SECONDS
+        try:
+            while discarded < budget:
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    break
+                self.connection.settimeout(remaining_seconds)
+                try:
+                    chunk = self.rfile.read1(
+                        min(OVERSIZED_BODY_DISCARD_CHUNK_BYTES, budget - discarded)
+                    )
+                except (TimeoutError, socket.timeout, OSError):
+                    break
+                if not chunk:
+                    outcome = "peer_closed"
+                    break
+                discarded += len(chunk)
+            if discarded == declared:
+                outcome = "complete"
+            elif discarded == budget:
+                outcome = "budget_exhausted"
+        finally:
+            self.close_connection = True
+            record = BodyRejectionRecord(
+                declared_bytes=declared,
+                route_limit_bytes=oversized.route_limit_bytes,
+                discard_budget_bytes=budget,
+                discarded_bytes=discarded,
+                elapsed_seconds=time.monotonic() - started,
+                body_complete=discarded == declared,
+                outcome=outcome,
+            )
+            observer = getattr(self.server, "remote_body_rejection_observer", None)
+            if observer is not None:
+                observer(record)
 
     def _remote_body(self, limit: int) -> bytes:
         raw_length = self.headers.get("Content-Length")
@@ -588,7 +672,7 @@ class RemoteRouteMixin:
         if length < 0:
             raise _bad("invalid_request", "valid Content-Length is required")
         if length > limit:
-            raise ProtocolError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large", "request body exceeds limit")
+            raise _OversizedBody(length, limit)
         data = self.rfile.read(length)
         if len(data) != length:
             raise _bad("invalid_request", "request body is truncated")
@@ -653,6 +737,8 @@ class RemoteRouteMixin:
                     self.end_headers()
                     return True
             raise ProtocolError(HTTPStatus.NOT_FOUND, "route_not_found", "route not found")
+        except _OversizedBody as oversized:
+            self._remote_reject_oversized_body(oversized)
         except ProtocolError as error:
             self._remote_error(error)
         except Exception:

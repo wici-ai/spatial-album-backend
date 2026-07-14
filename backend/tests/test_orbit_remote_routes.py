@@ -3,8 +3,10 @@ from __future__ import annotations
 import http.client
 import json
 import pathlib
+import socket
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -99,6 +101,14 @@ class OrbitRouteTest(unittest.TestCase):
         orbit.load_user_gallery = lambda: []
         orbit.build_gallery_records = lambda **_kwargs: []
         self.server = orbit.Server(("127.0.0.1", 0), orbit.Handler)
+        self.rejections = []
+        self.rejection_recorded = threading.Event()
+
+        def observe(record) -> None:
+            self.rejections.append(record)
+            self.rejection_recorded.set()
+
+        self.server.remote_body_rejection_observer = observe
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -120,6 +130,44 @@ class OrbitRouteTest(unittest.TestCase):
         result = (response.status, dict(response.getheaders()), data)
         connection.close()
         return result
+
+    def oversized_socket(self, declared: int) -> socket.socket:
+        connection = socket.create_connection(self.server.server_address, timeout=2)
+        connection.settimeout(2)
+        connection.sendall((
+            "POST /render/sessions HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {declared}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii"))
+        return connection
+
+    def read_complete_response(self, connection: socket.socket) -> tuple[dict[str, str], bytes]:
+        wire = bytearray()
+        while b"\r\n\r\n" not in wire:
+            chunk = connection.recv(4096)
+            self.assertTrue(chunk)
+            wire.extend(chunk)
+        headers, body = bytes(wire).split(b"\r\n\r\n", 1)
+        header_lines = headers.decode("iso-8859-1").split("\r\n")
+        self.assertEqual("413", header_lines[0].split(" ", 2)[1])
+        response_headers = {
+            name.lower(): value.strip()
+            for name, value in (line.split(":", 1) for line in header_lines[1:])
+        }
+        content_length = int(response_headers["content-length"])
+        while len(body) < content_length:
+            chunk = connection.recv(content_length - len(body))
+            self.assertTrue(chunk)
+            body += chunk
+        self.assertEqual(content_length, len(body))
+        self.assertEqual(("body_too_large", "close", "no-store"), (
+            json.loads(body)["error"]["code"],
+            response_headers["connection"],
+            response_headers["cache-control"],
+        ))
+        return response_headers, body
 
     def test_fake_engine_flows_through_orbit_handler_without_model_load(self) -> None:
         create = json.dumps(
@@ -172,6 +220,71 @@ class OrbitRouteTest(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("invalid_camera", json.loads(body)["error"]["code"])
+
+    def test_oversized_body_rejection_matches_http11_orbit_handler(self) -> None:
+        declared = 64 * 1024 + 4096
+        body = b"x" * declared
+        connection = self.oversized_socket(declared)
+        with connection:
+            connection.sendall(body)
+            self.read_complete_response(connection)
+        self.assertTrue(self.rejection_recorded.wait(1))
+        self.assertEqual((declared, True, "complete"), (
+            self.rejections[-1].discarded_bytes,
+            self.rejections[-1].body_complete,
+            self.rejections[-1].outcome,
+        ))
+        self.assertEqual([], self.engine.created)
+
+    def test_oversized_body_paced_send_matches_http11_orbit_handler(self) -> None:
+        declared = 64 * 1024 + 4096
+        body = b"x" * declared
+        first_chunk = 4096
+        continue_sending = threading.Event()
+        sender_errors = []
+        connection = self.oversized_socket(declared)
+        connection.sendall(body[:first_chunk])
+
+        def send_remainder() -> None:
+            continue_sending.wait(1)
+            try:
+                for offset in range(first_chunk, declared, 4096):
+                    connection.sendall(body[offset : offset + 4096])
+                    time.sleep(0.002)
+            except Exception as exc:
+                sender_errors.append(exc)
+
+        sender = threading.Thread(target=send_remainder)
+        sender.start()
+        try:
+            self.read_complete_response(connection)
+            continue_sending.set()
+            sender.join(1)
+            self.assertEqual([], sender_errors)
+            self.assertTrue(self.rejection_recorded.wait(1))
+        finally:
+            continue_sending.set()
+            sender.join(1)
+            connection.close()
+        self.assertEqual((declared, "complete"), (
+            self.rejections[-1].discarded_bytes, self.rejections[-1].outcome
+        ))
+        self.assertEqual([], self.engine.created)
+
+    def test_oversized_body_headers_only_matches_http11_orbit_handler(self) -> None:
+        declared = 64 * 1024 + 4096
+        connection = self.oversized_socket(declared)
+        started = time.monotonic()
+        with connection:
+            self.read_complete_response(connection)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(self.rejection_recorded.wait(1))
+        self.assertEqual((0, False, "peer_closed"), (
+            self.rejections[-1].discarded_bytes,
+            self.rejections[-1].body_complete,
+            self.rejections[-1].outcome,
+        ))
+        self.assertEqual([], self.engine.created)
 
 
 class OrbitEngineMappingTest(unittest.TestCase):

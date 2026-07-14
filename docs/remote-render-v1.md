@@ -163,6 +163,18 @@ on `code`, not English `message`.
 Unexpected server faults may use 500 `internal_error` and are retryable. No
 error response silently changes source, camera convention, or render mode.
 
+An oversized request is rejected before session or renderer ownership is
+created. The server sends and flushes a non-retryable JSON 413 with
+`Cache-Control: no-store` and `Connection: close`, then discards request bytes
+for at most 500 ms. A complete, graceful HTTP response is guaranteed when the
+declared body is no larger than the route limit plus 64 KiB and the whole body
+arrives inside that window. This budget is derived from the active route limit;
+the server never allocates the declared body size. For a larger, stalled, or
+infinite sender, the same JSON response is attempted first, but the server stops
+after the byte/time budget and closes the connection; TCP reset is therefore a
+documented possibility outside the bounded guarantee. Clients must not retry
+`body_too_large`.
+
 ## Compatibility policy
 
 This version has no implicit aliases or field coercion. Additive server metadata
