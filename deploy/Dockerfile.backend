@@ -28,6 +28,7 @@ ARG FLUX_DIFFUSERS_TARBALL=https://github.com/huggingface/diffusers/archive/216e
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       ca-certificates \
+      colmap \
       curl \
       ffmpeg \
       git \
@@ -36,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgl1 \
       libgomp1 \
       ninja-build \
+      patch \
       python3-pip \
       python3.12 \
       python3.12-dev \
@@ -52,6 +54,11 @@ RUN python3 -m pip install --break-system-packages \
 
 COPY third_party/ml-sharp /opt/sota/ml-sharp
 COPY third_party/Difix3D /opt/Difix3D
+RUN git clone https://github.com/nerfstudio-project/gsplat.git /opt/sota/gsplat \
+    && git -C /opt/sota/gsplat checkout "${GSPLAT_COMMIT}" \
+    && git -C /opt/sota/gsplat submodule update --init --recursive
+COPY deploy/patches/gsplat-preload-training.patch /tmp/gsplat-preload-training.patch
+RUN patch -p1 -d /opt/sota/gsplat < /tmp/gsplat-preload-training.patch
 
 # Orbit venv: renders with gsplat and loads SHARP in-process.
 # The old sharp-libs directory was a copied site-packages tree; keep the needed
@@ -94,7 +101,7 @@ RUN python3 -m venv --system-site-packages /opt/venvs/orbit \
       uvicorn==0.49.0 \
       wadler-lindig==0.1.7 \
     && TORCH_CUDA_ARCH_LIST=12.0 /opt/venvs/orbit/bin/python -m pip install --no-build-isolation \
-      "git+https://github.com/nerfstudio-project/gsplat.git@${GSPLAT_COMMIT}" \
+      /opt/sota/gsplat \
     && /opt/venvs/orbit/bin/python -m pip install \
       "git+https://github.com/huggingface/diffusers.git@${ORBIT_DIFFUSERS_COMMIT}" \
       "git+https://github.com/nianticlabs/spz.git@${SPZ_COMMIT}" \

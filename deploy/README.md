@@ -89,6 +89,14 @@ separate integration gate and have not been run for this change. The Caddy
 listener and mDNS discovery target a trusted LAN; they are not a complete
 public authentication, authorization, TLS, or multi-tenant isolation solution.
 
+Multi-view reconstruction uses the same Caddy listener at
+`/orbit/training/jobs`. The Orbit container installs CPU COLMAP and the pinned
+gsplat source, then applies `patches/gsplat-preload-training.patch` before the
+CUDA extension is built. Defaults are one active job, 64 images, a 512 MiB
+request, and 24 MiB per image. Set `WICI_GSPLAT_TRAINING_ENABLED=0` to disable
+the worker and remove its capability from `/orbit/health`. Job data lives under
+`WICI_GSPLAT_JOB_ROOT` and is removed when a client deletes a terminal job.
+
 The Docker image copies model code from git submodules:
 
 - `../third_party/ml-sharp`

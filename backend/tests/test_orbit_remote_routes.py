@@ -26,6 +26,7 @@ from backend.remote_render_service import (  # noqa: E402
     SessionManager,
     SessionResource,
 )
+from backend.gsplat_training_service import PROTOCOL as TRAINING_PROTOCOL  # noqa: E402
 
 
 JPEG = b"\xff\xd8orbit-fake\xff\xd9"
@@ -196,6 +197,12 @@ class OrbitRouteTest(unittest.TestCase):
         self.assertEqual(200, status)
         health = json.loads(body)
         self.assertIn(PROTOCOL, health["capabilities"])
+        self.assertIn(TRAINING_PROTOCOL, health["capabilities"])
+        self.assertEqual((True, TRAINING_PROTOCOL, True), (
+            health["gsplatTraining"]["enabled"],
+            health["gsplatTraining"]["protocol"],
+            health["gsplatTraining"]["preloadTrainingData"],
+        ))
         self.assertEqual(1, health["remoteRender"]["sessions"]["activeSessions"])
         remote_json = json.dumps(health["remoteRender"])
         self.assertNotIn("orbit_test_session", remote_json)

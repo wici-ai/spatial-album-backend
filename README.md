@@ -80,6 +80,14 @@ Orbit's container port directly. Local Android rendering continues to use the
 downloaded splat path, while remote rendering keeps the splat on the backend.
 See [`docs/remote-render-v1.md`](docs/remote-render-v1.md) for the wire contract.
 
+Orbit can also advertise `wici.gsplat-training.v1`. The Android app uploads an
+explicitly confirmed multi-view selection to `/orbit/training/jobs`, polls the
+bounded job, downloads the resulting `.splat`, and deletes the terminal job.
+The pinned gsplat trainer preloads the training tensors to CUDA once and crops
+batches on-device, avoiding per-step image H2D RPC traffic. See
+[`docs/gsplat-training-v1.md`](docs/gsplat-training-v1.md) for the wire,
+privacy, resource-limit, and step-scaling contract.
+
 ## Auto-Discovery
 
 The deploy installs a host-side Avahi/systemd advertiser for:
@@ -181,6 +189,8 @@ confirmed and obtained every license needed for your use case.
 ```text
 backend/
   orbit_preview_endpoint.py   # Orbit render, ingest, gallery/source helpers
+  gsplat_training_service.py  # bounded multi-view job and HTTP protocol
+  gsplat_training_worker.py   # COLMAP, CUDA-preloaded gsplat, viewer export
   sharp_endpoint.py           # SHARP module used in-process by Orbit
   mvp_difix_endpoint.py       # Difix refinement endpoint
   flux_endpoint.py            # FLUX.1-Fill endpoint

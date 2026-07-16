@@ -59,6 +59,24 @@ except ImportError:  # Direct script execution from backend/.
         SessionResource as RemoteSessionResource,
     )
 
+try:
+    from .gsplat_training_service import (
+        JobManager as GsplatJobManager,
+        Limits as GsplatTrainingLimits,
+        PROTOCOL as GSPLAT_TRAINING_PROTOCOL,
+        SubprocessRunner as GsplatSubprocessRunner,
+        TrainingRouteMixin,
+    )
+except ImportError:  # Direct script execution from backend/.
+    from gsplat_training_service import (  # type: ignore[no-redef]
+        JobManager as GsplatJobManager,
+        Limits as GsplatTrainingLimits,
+        PROTOCOL as GSPLAT_TRAINING_PROTOCOL,
+        SubprocessRunner as GsplatSubprocessRunner,
+        TrainingRouteMixin,
+    )
+
+
 
 VIEWER_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = VIEWER_ROOT.parent
@@ -112,6 +130,17 @@ REMOTE_LIMITS = RemoteLimits(
     idle_ttl_seconds=float(os.environ.get("WICI_REMOTE_SESSION_TTL_SECONDS", "120")),
     max_frame_pixels=int(os.environ.get("WICI_REMOTE_MAX_FRAME_PIXELS", str(1280 * 1280))),
     max_upload_bytes=int(float(os.environ.get("WICI_REMOTE_MAX_UPLOAD_MB", "20")) * 1024 * 1024),
+)
+GSPLAT_TRAINING_ENABLED = os.environ.get("WICI_GSPLAT_TRAINING_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+GSPLAT_TRAINING_COMMAND = os.environ.get(
+    "WICI_GSPLAT_TRAIN_COMMAND",
+    "/opt/venvs/orbit/bin/python /opt/wici/spatial-album-backend/backend/gsplat_training_worker.py",
+)
+GSPLAT_TRAINING_LIMITS = GsplatTrainingLimits(
+    max_jobs=int(os.environ.get("WICI_GSPLAT_MAX_JOBS", "1")),
+    max_images=int(os.environ.get("WICI_GSPLAT_MAX_IMAGES", "64")),
+    max_upload_bytes=int(float(os.environ.get("WICI_GSPLAT_MAX_UPLOAD_MB", "512")) * 1024 * 1024),
+    max_image_bytes=int(float(os.environ.get("WICI_GSPLAT_MAX_IMAGE_MB", "24")) * 1024 * 1024),
 )
 SPLAT_STREAM_SHUFFLE_SEED = int(os.environ.get("WICI_SPLAT_STREAM_SHUFFLE_SEED", "1337"))
 SH_C0 = 0.28209479177387814
@@ -2801,9 +2830,14 @@ _remote_render_manager: RemoteSessionManager | None = (
     if REMOTE_RENDER_ENABLED
     else None
 )
+_training_manager = GsplatJobManager(
+    Path(os.environ.get("WICI_GSPLAT_JOB_ROOT", str(CACHE_DIR / "gsplat-training"))),
+    GsplatSubprocessRunner(GSPLAT_TRAINING_COMMAND) if GSPLAT_TRAINING_ENABLED else None,
+    limits=GSPLAT_TRAINING_LIMITS,
+)
 
 
-class Handler(RemoteRouteMixin, BaseHTTPRequestHandler):
+class Handler(TrainingRouteMixin, RemoteRouteMixin, BaseHTTPRequestHandler):
     server_version = "WiCiOrbitPreview/1.0"
     protocol_version = "HTTP/1.1"
 
@@ -2815,6 +2849,8 @@ class Handler(RemoteRouteMixin, BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         global _last_preview
+        if self.dispatch_training(_training_manager, "GET"):
+            return
         parsed = urlparse(self.path)
         route = parsed.path
         params = parse_qs(parsed.query)
@@ -2834,7 +2870,11 @@ class Handler(RemoteRouteMixin, BaseHTTPRequestHandler):
                     "torch": torch.__version__,
                     "cudaVersion": torch.version.cuda,
                     "gsplat": "available",
-                    "capabilities": [REMOTE_RENDER_PROTOCOL] if _remote_render_manager is not None else [],
+                    "capabilities": (
+                        ([REMOTE_RENDER_PROTOCOL] if _remote_render_manager is not None else [])
+                        + ([GSPLAT_TRAINING_PROTOCOL] if _training_manager.enabled else [])
+                    ),
+                    "gsplatTraining": _training_manager.public(),
                     "remoteRender": {
                         "enabled": _remote_render_manager is not None,
                         "protocol": REMOTE_RENDER_PROTOCOL,
@@ -3054,6 +3094,8 @@ class Handler(RemoteRouteMixin, BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         global _last_ingest, _last_preview
+        if self.dispatch_training(_training_manager, "POST"):
+            return
         if self.dispatch_remote(_remote_render_manager, "POST"):
             return
         request_start = time.perf_counter()
@@ -3178,6 +3220,8 @@ class Handler(RemoteRouteMixin, BaseHTTPRequestHandler):
             )
 
     def do_DELETE(self) -> None:
+        if self.dispatch_training(_training_manager, "DELETE"):
+            return
         if self.dispatch_remote(_remote_render_manager, "DELETE"):
             return
         json_response(self, 404, {"ok": False, "error": "not_found"})
