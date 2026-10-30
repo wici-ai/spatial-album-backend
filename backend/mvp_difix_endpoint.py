@@ -24,6 +24,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from execution_control import controlled_http_task
 
 
 VIEWER_ROOT = Path(__file__).resolve().parent
@@ -770,6 +771,8 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
+    @controlled_http_task("wici-spatial-difix.service", {"/refine", "/api/difix-refine"},
+                          finish=lambda: _torch.cuda.synchronize() if _torch is not None else None)
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         if path not in {"/refine", "/api/difix-refine"}:
@@ -777,6 +780,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         request_start = time.perf_counter()
+        trace_id = self.headers.get("X-WiCi-Trace-Id") or ""
         timing: dict[str, Any] = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -876,6 +880,7 @@ class Handler(BaseHTTPRequestHandler):
                 timing["responseContentType"] = response_mime
 
                 meta = {
+                    "traceId": trace_id,
                     "requestId": request_id,
                     "latencySeconds": latency,
                     "run": run_meta,
@@ -899,6 +904,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 log_event(
                     "mvp_difix_request_timing",
+                    traceId=trace_id,
                     requestId=request_id,
                     photoId=payload.get("photoId"),
                     timingMs=timing,

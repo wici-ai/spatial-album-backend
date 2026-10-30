@@ -9,6 +9,12 @@ app to discover.
 
 This backend is for non-commercial / research use. See [Models And Licenses](#models-and-licenses).
 
+## Released host integration
+
+Version **v0.1.0** includes optional request admission and trace propagation
+for the WiCi Box host runtime. See [host scheduler deployment](docs/host-scheduler.md).
+Standalone Docker deployments do not require a scheduler adapter.
+
 ## Quick Install
 
 Run this on the local GPU box:

@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageColor, ImageOps
 from plyfile import PlyData
+from execution_control import controlled_http_task
 
 from gsplat.rendering import rasterization
 
@@ -2552,6 +2553,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         json_response(self, 204, {})
 
+    @controlled_http_task("wici-spatial-orbit.service",
+                          {"/splat", "/splat_stream", "/orbit_preview"},
+                          finish=lambda: torch.cuda.synchronize())
     def do_GET(self) -> None:
         global _last_preview
         parsed = urlparse(self.path)
@@ -2778,9 +2782,12 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
 
+    @controlled_http_task("wici-spatial-orbit.service", {"/ingest", "/ingest_preview"},
+                          finish=lambda: torch.cuda.synchronize())
     def do_POST(self) -> None:
         global _last_ingest, _last_preview
         request_start = time.perf_counter()
+        trace_id = self.headers.get("X-WiCi-Trace-Id") or ""
         parsed = urlparse(self.path)
         route = parsed.path
         params = parse_qs(parsed.query)
@@ -2799,6 +2806,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 log_event(
                     "ingest_preview_done",
+                    traceId=trace_id,
                     photoId=meta.get("photoId"),
                     timing=meta.get("timing"),
                     bytes=len(preview_bytes),
@@ -2811,7 +2819,7 @@ class Handler(BaseHTTPRequestHandler):
                     meta=meta,
                 )
             except Exception as exc:  # noqa: BLE001 - client needs the exact blocker.
-                log_event("ingest_preview_failed", error=repr(exc), traceback=traceback.format_exc(limit=8))
+                log_event("ingest_preview_failed", traceId=trace_id, error=repr(exc), traceback=traceback.format_exc(limit=8))
                 message = repr(exc)
                 if isinstance(exc, OSError) and "low disk space" in str(exc):
                     status = 507
@@ -2856,6 +2864,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             log_event(
                 "ingest_stream_response_start",
+                traceId=trace_id,
                 photoId=result.get("photoId"),
                 timing=result.get("timing"),
                 storage=result.get("storage"),
@@ -2875,13 +2884,14 @@ class Handler(BaseHTTPRequestHandler):
             }
             log_event(
                 "ingest_done",
+                traceId=trace_id,
                 photoId=result.get("photoId"),
                 timing=result.get("timing"),
                 storage=result.get("storage"),
                 streamStats=stream_stats,
             )
         except Exception as exc:  # noqa: BLE001 - client needs the exact blocker.
-            log_event("ingest_failed", error=repr(exc), traceback=traceback.format_exc(limit=8))
+            log_event("ingest_failed", traceId=trace_id, error=repr(exc), traceback=traceback.format_exc(limit=8))
             message = repr(exc)
             if isinstance(exc, OSError) and "low disk space" in str(exc):
                 status = 507

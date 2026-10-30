@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from execution_control import controlled_http_task
 
 
 VIEWER_ROOT = Path(__file__).resolve().parent
@@ -964,6 +965,8 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
+    @controlled_http_task("wici-spatial-flux.service", {"/fill"},
+                          finish=lambda: torch.cuda.synchronize())
     def do_POST(self) -> None:
         global _last_fill
         path = self.path.split("?", 1)[0]
@@ -971,6 +974,7 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 404, {"ok": False, "error": "not_found"})
             return
         request_start = time.perf_counter()
+        trace_id = self.headers.get("X-WiCi-Trace-Id") or ""
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > MAX_BODY_BYTES:
@@ -1008,6 +1012,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             meta["timing"]["handlerMs"] = meta["handlerMs"]
             meta["timing"]["otherHandlerMs"] = round(max(meta["handlerMs"] - measured_ms, 0.0), 1)
+            meta["traceId"] = trace_id
             _last_fill = meta
             log_event("flux_fill_done", **meta)
             json_response(
@@ -1023,7 +1028,7 @@ class Handler(BaseHTTPRequestHandler):
             del image, mask, output
         except Exception as exc:  # noqa: BLE001 - client needs exact blocker.
             retryable = "out of memory" in str(exc).lower() or "cuda" in str(exc).lower()
-            log_event("flux_fill_failed", error=repr(exc), traceback=traceback.format_exc(limit=8), retryable=retryable)
+            log_event("flux_fill_failed", traceId=trace_id, error=repr(exc), traceback=traceback.format_exc(limit=8), retryable=retryable)
             json_response(
                 self,
                 503 if retryable else 500,
