@@ -67,6 +67,18 @@ _source_cache_lock = threading.Lock()
 _source_cache: dict[str, Path] = {}
 _pipe: Any | None = None
 _torch: Any | None = None
+TRIM_UNUSED_CACHE = os.environ.get("WICI_SPATIAL_TRIM_UNUSED_CACHE", "0")
+if TRIM_UNUSED_CACHE not in {"0", "1"}:
+    raise ValueError("WICI_SPATIAL_TRIM_UNUSED_CACHE must be 0 or 1")
+
+
+def finish_difix_request() -> None:
+    if _torch is None:
+        return
+    _torch.cuda.synchronize()
+    # The handler frame has returned: free its unused activation cache, not weights.
+    if TRIM_UNUSED_CACHE == "1":
+        _torch.cuda.empty_cache()
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -772,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     @controlled_http_task("wici-spatial-difix.service", {"/refine", "/api/difix-refine"},
-                          finish=lambda: _torch.cuda.synchronize() if _torch is not None else None)
+                          finish=finish_difix_request)
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         if path not in {"/refine", "/api/difix-refine"}:

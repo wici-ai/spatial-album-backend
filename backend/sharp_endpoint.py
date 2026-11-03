@@ -21,6 +21,7 @@ DEFAULT_CKPT = "/models/torch/hub/checkpoints/sharp_2572gikvuh.pt"
 CKPT = Path(os.environ.get("SHARP_CKPT", DEFAULT_CKPT))
 MAX_BODY_BYTES = int(os.environ.get("SHARP_MAX_BODY_MB", "128")) * 1024 * 1024
 PRECISION = os.environ.get("SHARP_PRECISION", "fp16").strip().lower()
+WEIGHT_DTYPE = os.environ.get("SHARP_WEIGHT_DTYPE", "fp32").strip().lower()
 PROFILE_STEPS = os.environ.get("SHARP_PROFILE_STEPS", "0").strip().lower() in {"1", "true", "yes"}
 USE_CHANNELS_LAST = os.environ.get("SHARP_CHANNELS_LAST", "0").strip().lower() in {"1", "true", "yes"}
 USE_CUDNN_BENCHMARK = os.environ.get("SHARP_CUDNN_BENCHMARK", "0").strip().lower() in {"1", "true", "yes"}
@@ -175,7 +176,10 @@ def load_model() -> Any:
     sd = torch.load(CKPT, weights_only=True, map_location="cpu")
     m = create_predictor(PredictorParams())
     m.load_state_dict(sd)
-    m.eval().to("cuda")
+    weight_types = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+    if WEIGHT_DTYPE not in weight_types:
+        raise ValueError("SHARP_WEIGHT_DTYPE must be fp32, fp16 or bf16")
+    m.eval().to(device="cuda", dtype=weight_types[WEIGHT_DTYPE])
     if USE_CHANNELS_LAST:
         m.to(memory_format=torch.channels_last)
     torch.backends.cudnn.benchmark = USE_CUDNN_BENCHMARK
@@ -192,6 +196,7 @@ def load_model() -> Any:
         cudaDevice=torch.cuda.get_device_name(0),
         cudaCapability=list(cap),
         precision=PRECISION,
+        weightDtype=WEIGHT_DTYPE,
         channelsLast=USE_CHANNELS_LAST,
         cudnnBenchmark=USE_CUDNN_BENCHMARK,
         fastUnproject=USE_FAST_UNPROJECT,

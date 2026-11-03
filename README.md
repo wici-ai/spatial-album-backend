@@ -15,6 +15,9 @@ Version **v0.1.0** includes optional request admission and trace propagation
 for the WiCi Box host runtime. See [host scheduler deployment](docs/host-scheduler.md).
 Standalone Docker deployments do not require a scheduler adapter.
 
+Unreleased optional compact host settings are documented in
+[configuration](docs/configuration.md), including their quality acceptance limits.
+
 ## Quick Install
 
 Run this on the local GPU box:

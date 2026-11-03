@@ -35,6 +35,17 @@ from execution_control import controlled_http_task
 
 from gsplat.rendering import rasterization
 
+TRIM_UNUSED_CACHE = os.environ.get("WICI_SPATIAL_TRIM_UNUSED_CACHE", "0")
+if TRIM_UNUSED_CACHE not in {"0", "1"}:
+    raise ValueError("WICI_SPATIAL_TRIM_UNUSED_CACHE must be 0 or 1")
+
+
+def finish_orbit_request() -> None:
+    torch.cuda.synchronize()
+    # Release unused activation buffers while keeping SHARP weights on GPU.
+    if TRIM_UNUSED_CACHE == "1":
+        torch.cuda.empty_cache()
+
 
 VIEWER_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = VIEWER_ROOT.parent
@@ -2555,7 +2566,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @controlled_http_task("wici-spatial-orbit.service",
                           {"/splat", "/splat_stream", "/orbit_preview"},
-                          finish=lambda: torch.cuda.synchronize())
+                          finish=finish_orbit_request)
     def do_GET(self) -> None:
         global _last_preview
         parsed = urlparse(self.path)
@@ -2783,7 +2794,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     @controlled_http_task("wici-spatial-orbit.service", {"/ingest", "/ingest_preview"},
-                          finish=lambda: torch.cuda.synchronize())
+                          finish=finish_orbit_request)
     def do_POST(self) -> None:
         global _last_ingest, _last_preview
         request_start = time.perf_counter()
@@ -2924,6 +2935,8 @@ def main() -> int:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ensure_inproc_sharp_loaded()
     run_inproc_sharp_startup_warmup()
+    if TRIM_UNUSED_CACHE == "1":
+        finish_orbit_request()
     log_event(
         "orbit_preview_endpoint_start",
         host=args.host,

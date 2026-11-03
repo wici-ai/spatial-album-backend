@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from PIL import Image
 from execution_control import controlled_http_task
+from fill_size import parse_max_side, prepare_fill_input, restore_fill_output
 
 
 VIEWER_ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ VAE_CKPT = Path(os.environ.get("WICI_FLUX_VAE", "/models/ComfyUI/models/vae/ae.s
 TOKEN_FILE = Path(os.environ.get("WICI_HF_TOKEN_FILE", "/models/hf-token"))
 PROMPT = "fill in the missing background to match the surrounding scene, with consistent texture, color and lighting."
 QUANT_MODE = os.environ.get("WICI_FLUX_QUANT_MODE", "bnb8").strip().lower()
+INPAINT_MAX_SIDE = parse_max_side(os.environ.get("WICI_INPAINT_MAX_SIDE", "0"))
 NUM_STEPS = int(os.environ.get("WICI_FLUX_NUM_STEPS", "20"))
 GUIDANCE = float(os.environ.get("WICI_FLUX_GUIDANCE", "30.0"))
 SEED = int(os.environ.get("WICI_FLUX_SEED", "0"))
@@ -77,8 +79,8 @@ COMPILE_MODE = os.environ.get("WICI_FLUX_COMPILE_MODE", "default").strip().lower
 COMPILE_DYNAMIC = env_bool("WICI_FLUX_COMPILE_DYNAMIC", True)
 BNB8_BF16_IO = env_bool("WICI_FLUX_BNB8_BF16_IO", False)
 
-if QUANT_MODE not in {"bnb8", "fp8"}:
-    raise ValueError(f"WICI_FLUX_QUANT_MODE must be bnb8 or fp8, got {QUANT_MODE!r}")
+if QUANT_MODE not in {"bnb8", "bnb4", "fp8"}:
+    raise ValueError(f"WICI_FLUX_QUANT_MODE must be bnb8, bnb4 or fp8, got {QUANT_MODE!r}")
 if COMPILE_MODE not in {"default", "reduce-overhead", "max-autotune"}:
     raise ValueError(
         "WICI_FLUX_COMPILE_MODE must be default, reduce-overhead, or max-autotune, "
@@ -716,28 +718,36 @@ def load_model() -> None:
     ensure_prompt_embeds()
     config_seconds = time.perf_counter() - t0
 
-    if QUANT_MODE == "bnb8":
+    if QUANT_MODE in {"bnb8", "bnb4"}:
         patch_bnb_prequantized()
     from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, FluxFillPipeline
     from diffusers import FluxTransformer2DModel
 
     t = time.perf_counter()
     quant_status: dict[str, Any]
-    if QUANT_MODE == "bnb8":
+    if QUANT_MODE in {"bnb8", "bnb4"}:
         from diffusers import BitsAndBytesConfig
 
-        quant = BitsAndBytesConfig(load_in_8bit=True)
+        if QUANT_MODE == "bnb4":
+            quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                      bnb_4bit_use_double_quant=True,
+                                      bnb_4bit_compute_dtype=torch.bfloat16)
+        else:
+            quant = BitsAndBytesConfig(load_in_8bit=True)
         transformer = FluxTransformer2DModel.from_single_file(
             str(TRANSFORMER_CKPT),
             config=str(CONFIG_DIR / "transformer"),
             local_files_only=True,
             token=False,
             quantization_config=quant,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16 if QUANT_MODE == "bnb4" else torch.float16,
             device="cuda",
         )
-        quant_status = {"mode": "bnb8", "library": "bitsandbytes", "loadIn8bit": True}
-        prompt_dtype = torch.bfloat16 if BNB8_BF16_IO else torch.float16
+        quant_status = {"mode": QUANT_MODE, "library": "bitsandbytes",
+                        "loadIn8bit": QUANT_MODE == "bnb8", "loadIn4bit": QUANT_MODE == "bnb4"}
+        if QUANT_MODE == "bnb4":
+            quant_status.update(quantType="nf4", doubleQuant=True, computeDtype="bf16")
+        prompt_dtype = torch.bfloat16 if QUANT_MODE == "bnb4" or BNB8_BF16_IO else torch.float16
     else:
         transformer = FluxTransformer2DModel.from_single_file(
             str(TRANSFORMER_CKPT),
@@ -758,7 +768,7 @@ def load_model() -> None:
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         str(CONFIG_DIR), subfolder="scheduler", local_files_only=True
     )
-    vae_dtype = torch.bfloat16 if QUANT_MODE == "fp8" or (QUANT_MODE == "bnb8" and BNB8_BF16_IO) else torch.float16
+    vae_dtype = torch.bfloat16 if QUANT_MODE in {"fp8", "bnb4"} or (QUANT_MODE == "bnb8" and BNB8_BF16_IO) else torch.float16
     vae = AutoencoderKL.from_single_file(
         str(VAE_CKPT),
         config=str(CONFIG_DIR / "vae"),
@@ -775,6 +785,9 @@ def load_model() -> None:
         tokenizer_2=None,
         transformer=transformer,
     )
+    if QUANT_MODE == "bnb4":
+        _pipe.vae.enable_tiling()
+        _pipe.vae.enable_slicing()
     lora_status = apply_filtered_turbo_lora(transformer)
     linear8_count = sum(1 for m in transformer.modules() if m.__class__.__name__ == "Linear8bitLt")
     float8_weight_count = sum(
@@ -795,6 +808,8 @@ def load_model() -> None:
         "prompt": PROMPT,
         "officialConfig": str(CONFIG_DIR / "transformer/config.json"),
         "linear8Count": linear8_count,
+        "linear4Count": sum(1 for module in transformer.modules() if module.__class__.__name__ == "Linear4bit"),
+        "transformerFootprintMiB": round(transformer.get_memory_footprint() / 1024**2, 1),
         "float8WeightCount": float8_weight_count,
         "promptDtype": str(prompt_dtype),
         "vaeDtype": str(vae_dtype),
@@ -821,6 +836,7 @@ def run_fill(
     pad_start = time.perf_counter()
     base = image.convert("RGB")
     padded, padded_mask, mask_bool, input_mask_bool = pad_image_and_mask(base, mask, dilate_px)
+    working_image, working_mask = prepare_fill_input(padded, padded_mask, INPAINT_MAX_SIDE)
     pad_seconds = time.perf_counter() - pad_start
     torch.cuda.reset_peak_memory_stats()
     start_vram = smi_memory()
@@ -838,10 +854,10 @@ def run_fill(
         generated = _pipe(
             prompt_embeds=_prompt_embeds,
             pooled_prompt_embeds=_pooled_prompt_embeds,
-            image=padded,
-            mask_image=padded_mask,
-            height=padded.height,
-            width=padded.width,
+            image=working_image,
+            mask_image=working_mask,
+            height=working_image.height,
+            width=working_image.width,
             strength=1.0,
             num_inference_steps=NUM_STEPS,
             guidance_scale=GUIDANCE,
@@ -851,6 +867,7 @@ def run_fill(
             callback_on_step_end_tensor_inputs=[],
             output_type="pil",
         ).images[0]
+        generated = restore_fill_output(generated, padded.size)
     torch.cuda.synchronize()
     pipe_end = time.perf_counter()
     seconds = pipe_end - t0
@@ -890,6 +907,9 @@ def run_fill(
     timing["compositeMs"] = round((time.perf_counter() - composite_start) * 1000, 1)
     meta = {
         "photoId": photo_id,
+        "backend": "flux",
+        "inferenceSize": list(working_image.size),
+        "cpuOffload": False,
         "seconds": seconds,
         "steps": NUM_STEPS,
         "guidance": GUIDANCE,
