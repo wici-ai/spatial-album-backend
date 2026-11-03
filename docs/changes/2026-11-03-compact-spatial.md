@@ -3,7 +3,7 @@
 - Owner: Pending: assign a GitHub username
 - Date: 2026-11-03
 - Issue: https://github.com/wici-ai/wici-environment-bootstrap/issues/39
-- PR: Pending: implementation PR
+- PR: https://github.com/wici-ai/spatial-album-backend/pull/2
 - Status: draft
 
 ## Purpose
