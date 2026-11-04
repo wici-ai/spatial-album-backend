@@ -51,6 +51,11 @@ and output API remain compatible; no model migration is required.
 
 ## Follow-up
 
-Keep draft until owner/test date are assigned and fill quality is accepted.
-Cross-repository integration is tracked by Issue 39. Substantive implementation
-and tests were prepared with Codex assistance.
+On 2026-11-04 the owner explicitly requested merging PR #2 into main using local
+`--ff-only` integration and publishing v0.1.1 as a source release, matching
+v0.1.0's format. Publication does not change the failed quality result or imply
+full native UI/5090/clean-host acceptance. Owner/test-date assignment and fill
+quality follow-up remain tracked by Issue 39. CPU checks were rerun locally:
+8 tests passed and all six backend modules parsed. Substantive implementation,
+tests and release preparation used Codex assistance. No live service deployment
+or restart is part of publication.

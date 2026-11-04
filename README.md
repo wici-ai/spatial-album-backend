@@ -11,12 +11,14 @@ This backend is for non-commercial / research use. See [Models And Licenses](#mo
 
 ## Released host integration
 
-Version **v0.1.0** includes optional request admission and trace propagation
+Version **v0.1.1** includes optional request admission and trace propagation
 for the WiCi Box host runtime. See [host scheduler deployment](docs/host-scheduler.md).
 Standalone Docker deployments do not require a scheduler adapter.
 
-Unreleased optional compact host settings are documented in
-[configuration](docs/configuration.md), including their quality acceptance limits.
+Optional compact host settings are documented in
+[configuration](docs/configuration.md) and the [v0.1.1 release notes](docs/release-v0.1.1.md).
+The compact NF4 fill has a known quality failure; publication does not establish
+full quality acceptance or a universal three-process memory bound.
 
 ## Quick Install
 

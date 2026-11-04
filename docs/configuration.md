@@ -27,5 +27,5 @@ remove the added settings or use the large profile, then restart the three host
 services through their normal lifecycle. Model files are unchanged.
 
 See [the dated change record](changes/2026-11-03-compact-spatial.md) for measurements
-and incomplete quality acceptance. Bootstrap must pin the reviewed backend commit;
-existing v0.1.0 release assets do not contain this unreleased change.
+and incomplete quality acceptance. Bootstrap must pin the v0.1.1 release and its
+exact source commit; v0.1.0 does not contain these optional controls.
